@@ -1,0 +1,56 @@
+name: audit
+
+# 依赖安全扫描（规格 F-45 / 缺陷 D7）。
+#
+# ## 为什么单独一个工作流，而不是塞进 pr-check
+#
+# `cargo audit` / `npm audit` 的**数据源每天在变**：今天全绿的锁文件，明天可能因为
+# 上游披露了一个 CVE 而变红。把它挂到每个 PR 上，结果是「别人的漏洞挡住你的重构」，
+# 团队很快就会学会 `continue-on-error` —— 那时门禁就名存实亡了。
+#
+# 所以这里按**时间**触发（每周一 03:17 UTC），并且允许手动跑：
+#   · 红了 ⇒ 是「依赖需要升级」这件事本身该被看见，不是某次 PR 写错了；
+#   · 想让锁文件升级的 PR 也可以手动 dispatch 本工作流做一次前置检查。
+#
+# ⚠️ 不设 `continue-on-error`：扫描失败就是失败。它的运行成本低、误报可解释，
+#    没有「噪音太大所以关掉」的理由。
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-audit:
+    name: Rust 依赖漏洞（cargo audit）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # `rustsec/audit-check` 直接读 Cargo.lock，不需要先编译整个 workspace。
+      # `token` 用于在发现漏洞时创建/更新 issue（无 issue 权限时仍会失败退出，
+      # 这正是我们要的「红」）。
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  npm-audit:
+    name: 前端依赖漏洞（npm audit）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      # ⚠️ 只审**生产依赖**（`--omit=dev`）：devDependencies 里有 vite/tsup 这类
+      #   构建期工具，它们的高危告警修不动也不该影响发布物；把 dev 也纳入会让
+      #   这个工作流长期红而无人处理。
+      # `--audit-level=high`：moderate 只提示、不阻断（本仓的取舍，写在 docs 里）。
+      - name: npm audit (production deps)
+        run: npm audit --omit=dev --audit-level=high
