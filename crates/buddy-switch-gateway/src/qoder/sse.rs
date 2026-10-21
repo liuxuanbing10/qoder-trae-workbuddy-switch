@@ -26,6 +26,13 @@ use serde_json::{json, Map, Value};
 
 use buddy_switch_core::modules::qoder::api::{self, ChatFrame};
 
+/// 单条 SSE 行的字节上限（规格 D11：**SSE 行缓冲 256KB 封顶**）。
+///
+/// 上游是逐帧 JSON，正常一帧几 KB；256 KB 足够装下「一整段代码 + data URL 图片」。
+/// 没有上限时，一个畸形（或半开）上游只要持续不吐 `\n`，`buffer` 就会把整段响应
+/// 攒进内存 —— 流式转发退化成「先全收再解」，几百 MB 的响应足以拖垮进程。
+pub const MAX_SSE_LINE_BYTES: usize = 256 * 1024;
+
 /// 一行是否含 `[DONE]` 哨兵（转发层不需要精确判断，聚合层走结构化解包）。
 fn process_line(line: &str) -> (Vec<Bytes>, bool) {
     match api::unwrap_envelope_line(line) {
@@ -106,6 +113,27 @@ impl<S> QoderOpenAiStream<S> {
             self.done_sent = true;
         }
     }
+
+    /// 超长帧：**明确终止**，而不是继续攒内存（见 [`MAX_SSE_LINE_BYTES`]）。
+    ///
+    /// 出口必须是「一条 error 帧 + `[DONE]`」：客户端已经收到 200 与部分帧，
+    /// 静默 `None` 会被当成正常结束 —— 内容被截断而用户不自知。
+    fn fail_line_too_long(&mut self) {
+        let frame = json!({
+            "error": {
+                "message": format!(
+                    "上游单帧超过 {} KB，已中止本次转发",
+                    MAX_SSE_LINE_BYTES / 1024
+                ),
+                "type": "upstream_frame_too_large",
+                "code": 502,
+            }
+        });
+        self.pending
+            .push_back(Bytes::from(format!("data: {frame}\n\n")));
+        self.buffer.clear();
+        self.upstream_done = true;
+    }
 }
 
 impl<S, E> Stream for QoderOpenAiStream<S>
@@ -133,6 +161,10 @@ where
                 Poll::Ready(Some(Ok(chunk))) => {
                     this.buffer.extend_from_slice(&chunk);
                     this.drain_lines();
+                    // 解完完整行之后仍有超过上限的**残行** ⇒ 这一帧本身畸形。
+                    if this.buffer.len() > MAX_SSE_LINE_BYTES {
+                        this.fail_line_too_long();
+                    }
                 }
                 Poll::Ready(Some(Err(_error))) => {
                     // 中途异常：补 [DONE] 收尾（不悬挂），错误详情由请求侧日志记录。
@@ -2465,5 +2497,36 @@ mod tests {
         );
         assert!(text.contains("\"name\":\"pwsh\""), "{text}");
         assert!(text.contains("Get-Process"), "{text}");
+    }
+
+    /// D11 护栏：**单个不下换行的超长帧**必须有界终止，而不是无限攒内存。
+    ///
+    /// 变异：去掉 `poll_next` 里的 `MAX_SSE_LINE_BYTES` 检查 ⇒ 第一条断言红
+    /// （缓冲被一路吃下、既不报错也不结束）；只清 buffer 不补 `[DONE]` ⇒ 第二条红。
+    #[tokio::test]
+    async fn oversized_single_line_terminates_with_error_and_done() {
+        // 两个半帧拼起来恰好超过上限，且**全程没有 `\n`** —— 正是「畸形上游」的形态。
+        let chunk = vec![b'x'; MAX_SSE_LINE_BYTES / 2 + 1];
+        let items: Vec<Result<Bytes, io::Error>> = vec![
+            Ok(Bytes::from(chunk.clone())),
+            Ok(Bytes::from(chunk)),
+            // 第三块干脆不给：一旦终止，Stream 不应再被轮询出内容。
+        ];
+        let mut stream = QoderOpenAiStream::new(futures_util::stream::iter(items));
+        let text = collect(&mut stream).await;
+
+        assert!(
+            text.contains("upstream_frame_too_large"),
+            "超长帧必须给出明确错误帧，实际：{text}"
+        );
+        assert!(
+            text.trim_end().ends_with("data: [DONE]"),
+            "错误帧之后仍必须补 [DONE]（否则客户端悬挂），实际：{text}"
+        );
+        assert!(
+            text.len() < MAX_SSE_LINE_BYTES,
+            "不得把超长缓冲原样转发出去（实际长度 {}）",
+            text.len()
+        );
     }
 }

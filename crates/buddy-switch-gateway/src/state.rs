@@ -366,8 +366,24 @@ impl GatewayState {
             config.log_keep,
             config.log_bodies,
         ));
+        // ★ 分级超时（规格 D11）：**不设总超时**。
+        //
+        // 原先这里是 `Client::builder().timeout(600s)` —— 那是 reqwest 的**整体请求**超时，
+        // 对 SSE 流式对话是致命的：一段长回答（或工具链路上游长时间思考）一旦超过 10 分钟，
+        // 连接被**本机网关**掐断，客户端只看到「流突然结束」，而上游其实还在生成。
+        // Trae / Qoder 两侧早就是这个口径（见 `trae/mod.rs`、`qoder/mod.rs` 的注释），
+        // 只有 WB 这条主链路漏了，属于同一仓内两套标准。
+        //
+        // 现在改为：
+        // - `connect_timeout(10s)`：只约束**建连**，DNS/握手卡住要尽快失败；
+        // - `read_timeout(300s)`：约束**单次读**的空闲时长（上游 5 分钟不吐一个字节 ⇒ 断），
+        //   与 Trae/Qoder 的 300s 对齐；正常流式对话每几秒就有一帧，永远碰不到它。
+        //
+        // 首包 30s 由 `routes::relay` 的 `FIRST_FRAME_WAIT` 单独管 —— 那一层能换号重试，
+        // 比在这里设总超时更有意义（总超时只会把「该换号」变成「该报错」）。
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(600))
+            .connect_timeout(Duration::from_secs(10))
+            .read_timeout(Duration::from_secs(300))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         let upstream = Arc::new(UpstreamClient::new(http));
