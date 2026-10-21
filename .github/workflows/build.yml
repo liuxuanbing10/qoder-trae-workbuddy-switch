@@ -111,9 +111,50 @@ jobs:
               f.write("EOF\n")
           PY
 
+  # ---------------------------------------------------------------------------
+  # tag 发布前置门禁（规格 F-51 / 缺陷 D7）
+  #
+  # 此前 `push: tags: ["v*"]` 会**绕过全部门禁直接发 Release**：PR 上的
+  # pr-check 只在 PR/主干跑，tag 推送不经过它 ⇒ 一个没跑过测试的提交也能成为
+  # 「正式版」。发布物一旦带上签名与 updater 清单，撤回成本远高于多等 10 分钟。
+  #
+  # 这里只跑**能在 ubuntu 上独立完成**的三件事：契约/类型、格式、核心测试。
+  # 不重复 build job 的打包工作（那需要签名密钥，且已在各平台矩阵里做）。
+  # `build` 与 `publish-*` 全部 `needs` 它 ⇒ 门禁红则一个产物都不产出。
+  # ---------------------------------------------------------------------------
+  gate:
+    name: Pre-release gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      # `npm run build` = tsc + 全部契约检查 + vite build。前端契约红了就不该发版。
+      - name: Frontend contract checks
+        run: |
+          npm ci
+          npm run build
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: true
+          cache-key: gate-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      # ⚠️ `--test-threads=1`：本仓已知并行跑 core 的 vscode_session 用例会互相干扰
+      # （见 docs/specs/P14-TASKS.md「环境观察」）。发布门禁宁可慢，不可偶发红。
+      - name: Core + gateway tests
+        run: cargo test -p buddy-switch-core -p buddy-switch-gateway --lib -- --test-threads=1
+
   build:
     name: ${{ matrix.name }}
-    needs: select-matrix
+    needs: [select-matrix, gate]
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.select-matrix.outputs.matrix) }}
