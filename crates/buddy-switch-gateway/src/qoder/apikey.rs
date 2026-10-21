@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::apikey::constant_time_eq;
 use buddy_switch_core::modules::qoder::region::QoderRegion;
 
 /// 新 Key 的前缀字面量（创建时 `sk-qoder-<secret 前 4 位>`）。
@@ -192,6 +193,13 @@ impl QoderApiKeyStore {
     }
 
     /// 校验一把明文 Key：命中且未吊销 ⇒ 记录，并**顺手 touch** `lastUsedAt`。
+    ///
+    /// ★ **常量时间比较**（规格 D4）：命中的判据走 [`constant_time_eq`]，**不**用
+    /// `record.hash == hash`。`String` 的 `==` 在首个不同字节处就返回，比较耗时随
+    /// 「共同前缀长度」线性变化；键校验是网关的安全边界，没有理由留一条「只差写法」的
+    /// 时序侧信道。哈希是 64 位小写 hex（恒等长），长度不同由 [`constant_time_eq`] 判否。
+    ///
+    /// ⚠️ 遍历**不提前 break**：提前退出会把「命中第几条记录」写进耗时。
     pub fn verify(&self, presented: &str) -> Option<QoderApiKeyRecord> {
         let trimmed = presented.trim();
         if trimmed.is_empty() {
@@ -199,9 +207,13 @@ impl QoderApiKeyStore {
         }
         let hash = sha256_hex(trimmed);
         let records = self.load();
-        let record = records
-            .iter()
-            .find(|record| record.hash == hash && !record.is_revoked())?;
+        let mut matched: Option<&QoderApiKeyRecord> = None;
+        for record in &records {
+            if constant_time_eq(record.hash.as_bytes(), hash.as_bytes()) && !record.is_revoked() {
+                matched = Some(record);
+            }
+        }
+        let record = matched?;
         self.touch(&record.id);
         Some(record.clone())
     }
@@ -378,5 +390,58 @@ mod tests {
             .verify("qd-ffffffffffffffffffffffffffffffff")
             .is_none());
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// 校验必须是**常量时间比较**（规格 D4）。
+    ///
+    /// 行为面：只差最后一个字符 / 长度不同 / 空串都必须判否，正确明文必须判是。
+    /// 结构面：本仓没有给 `constant_time_eq` 打桩的手段，所以另加一条源码级断言 ——
+    /// `verify` 的实现里**不得再出现** `record.hash ==` 这种短路径比较
+    /// （变异：把实现改回 `==` ⇒ 本条红）。
+    #[test]
+    fn verify_compares_in_constant_time_and_rejects_near_misses() {
+        let (store, path) = temp_store();
+        let (record, secret) = store.create("ct".into(), QoderRegion::Cn).unwrap();
+
+        // 正确明文 ⇒ 命中同一条记录。
+        let hit = store.verify(&secret).expect("正确明文必须通过");
+        assert_eq!(hit.id, record.id);
+
+        // 等长但末位不同（近失配）⇒ 否。
+        let mut near_miss = secret.clone().into_bytes();
+        let last = near_miss.len() - 1;
+        near_miss[last] = if near_miss[last] == b'0' { b'1' } else { b'0' };
+        let near_miss = String::from_utf8(near_miss).unwrap();
+        assert!(
+            store.verify(&near_miss).is_none(),
+            "末位不同的 Key 必须被拒"
+        );
+
+        // 长度不同 ⇒ 否（`constant_time_eq` 的长度分支）。
+        assert!(store.verify(&secret[..secret.len() - 1]).is_none());
+        assert!(store.verify("").is_none());
+        assert!(store.verify("   ").is_none());
+
+        // 首尾空白被 trim（既有契约），不得因 trim 丢掉命中。
+        assert!(store.verify(&format!("  {secret}  ")).is_some());
+
+        let _ = std::fs::remove_file(&path);
+
+        let source = include_str!("apikey.rs");
+        let verify_body = source
+            .split("pub fn verify(&self, presented: &str)")
+            .nth(1)
+            .expect("找不到 verify 实现");
+        let verify_body = &verify_body[..verify_body
+            .find("pub fn touch")
+            .unwrap_or(verify_body.len())];
+        assert!(
+            verify_body.contains("constant_time_eq"),
+            "verify 必须走 constant_time_eq"
+        );
+        assert!(
+            !verify_body.contains("record.hash ==") && !verify_body.contains(".hash == hash"),
+            "verify 不得回退到短路径字符串比较（D4）"
+        );
     }
 }
