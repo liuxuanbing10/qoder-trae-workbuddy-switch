@@ -45,6 +45,34 @@ jobs:
       - name: Build (tsc + contract checks + vite)
         run: npm run build
 
+  windows:
+    name: Windows compile smoke (core + gateway)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 规格 D7 / F-50 的最小可行落地。
+      #
+      # 本仓长期只有 ubuntu 在跑 Rust 门禁，而**桌面主战场是 Windows**：
+      # `#[cfg(windows)]` 分支、路径分隔符、`CREATE_NO_WINDOW`、进程检测这些
+      # 只在 Windows 编译的代码，红了要等到发版才被发现（`build.yml` 的 Windows
+      # job 恰恰是**不跑测试**的那个）。
+      #
+      # 为什么不是「整个 workspace 在 Windows 上 test」：
+      #   · `src-tauri` 要编 WebView2/updater，单轮 20 min 起；
+      #   · core 的会话用例在 Windows 上并行会互踩（见 P14-TASKS「环境观察」）。
+      # ⇒ 这里只做 core + gateway 的 **编译** 烟测（含 `#[cfg(test)]` 分支），
+      #   成本 ~5 min，专抓「只有 Windows 才编不过」这一类问题。
+      #
+      # 不加 `needs: rust`：两者相互独立，并行跑才能把总时长压住。
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: true
+          cache-key: windows-smoke-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: cargo check (all targets)
+        run: cargo check -p buddy-switch-core -p buddy-switch-gateway --all-targets
+
   rust:
     name: Rust fmt / clippy / test
     runs-on: ubuntu-latest
