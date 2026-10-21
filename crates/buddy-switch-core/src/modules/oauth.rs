@@ -197,10 +197,28 @@ pub async fn oauth_poll_for(region: Region, login_id: &str) -> Value {
         "createdAt": now_ms(),
     });
 
-    let account = match account::save_collected_account_for(region, account) {
+    // ★ 规格 D11：`save_collected_account_for` 是**同步落盘**（读整本账号库 → 改 →
+    //   原子重写整个 JSON）。在 async 上下文里直接调用会占住一个 tokio worker 线程
+    //   走完整个磁盘往返；账号库被杀软/机械盘拖慢时是几十毫秒级，同 worker 上的
+    //   其它请求（含网关转发）会被一起卡住。
+    //
+    //   改用 `spawn_blocking`：阻塞 IO 走独立线程池，worker 线程立刻让出。
+    //   错误分两档上报（落盘失败 / 阻塞任务 panic），都落进 `oauth_states` 供轮询读取。
+    let save_region = region;
+    let saved = match tokio::task::spawn_blocking(move || {
+        account::save_collected_account_for(save_region, account)
+    })
+    .await
+    {
+        Ok(Ok(saved)) => Ok(saved),
+        Ok(Err(error)) => Err(format!("保存账号失败: {error}")),
+        // join 失败 = 阻塞任务 panic；把它转成可读错误，不能让轮询端永久等下去。
+        Err(join_error) => Err(format!("保存账号失败: 后台任务异常（{join_error}）")),
+    };
+
+    let account = match saved {
         Ok(saved) => saved,
         Err(error) => {
-            let error = format!("保存账号失败: {error}");
             let mut map = oauth_states().lock().unwrap();
             if let Some(info) = map.get_mut(login_id) {
                 info.done = true;
