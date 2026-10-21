@@ -326,20 +326,72 @@ pub fn client_executable_for(region: Region) -> PathBuf {
     path
 }
 
-/// 探针脚本落盘路径（固定名，每次覆盖写；内容只有 1 KB）。
+/// 探针脚本的落盘句柄：**构造即创建，`Drop` 即删除**。
 ///
-/// ⚠️ **固定名是刻意的**（避免每次调用泄漏一个新文件）⇒ 因此**写与读必须互斥**：
-/// 并发调用 [`fetch_build_key`] 时，若 A 刚写完、B 又写，A 的子进程可能读到**半个文件**
-/// （`fs::write` 先截断再写）。⇒ 用 [`PROBE_LOCK`] 把「写 → 起子进程（读）」串起来。
-fn key_probe_path() -> PathBuf {
-    std::env::temp_dir().join("buddy-switch-at-rest-key.js")
+/// ⚠️ 早期实现用**固定名**（`buddy-switch-at-rest-key.js`，每次覆盖写），代价是
+/// 同机任何进程都能在锁外**预先创建**该路径（符号链接 / 目录 / 半截脚本），
+/// `fs::write` 会跟着覆盖或写失败 —— 这就是规格 D5 的 TOCTOU。现改为每次一个新名字。
+///
+/// ★ 修复口径：
+///
+/// 1. 文件名带 **pid + 单调计数 + 纳秒**，不可预测；
+/// 2. `create_new(true)` 独占创建 —— 目标已存在（含符号链接）⇒ 直接失败，**不跟随**；
+/// 3. Unix 上以 `0600` 创建（临时目录是 1777，别人可读 ⇒ 必须自己收权限）；
+/// 4. 子进程读完（[`fetch_build_key`] 返回）由 `Drop` 删除，不长期残留。
+struct ProbeScript {
+    path: PathBuf,
 }
 
-/// 探针文件的**进程级互斥**（理由见 [`key_probe_path`]）。
+impl Drop for ProbeScript {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// 生成一个**必不重复**的探针脚本路径（见 [`ProbeScript`] 的四条口径）。
+fn probe_script_path() -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!(
+        "buddy-switch-at-rest-key-{}-{seq}-{nanos}.js",
+        std::process::id()
+    ))
+}
+
+/// 独占创建探针脚本（`create_new` + 0600 + 写失败即清理）。
+fn write_probe_script() -> Result<ProbeScript, AtRestError> {
+    use std::io::Write;
+
+    let path = probe_script_path();
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path).map_err(|error| {
+        AtRestError::Spawn(format!("创建探针脚本失败（{}）：{error}", path.display()))
+    })?;
+    if let Err(error) = file.write_all(KEY_PROBE_JS.as_bytes()) {
+        // 写失败时**必须**自己清理：此时 `ProbeScript` 还没构造，`Drop` 不会帮忙。
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        return Err(AtRestError::Spawn(format!("写探针脚本失败：{error}")));
+    }
+    Ok(ProbeScript { path })
+}
+
+/// 探针子进程的**进程级互斥**。
 ///
-/// ⚠️ 不是性能优化，是**正确性**：`fs::write` 会先截断，两个并发写会让读者看到空/半文件。
-/// 持锁范围覆盖「写脚本 + 起子进程」——取钥本身是慢操作（起 Electron 子进程），
-/// 串行化它不会成为瓶颈。
+/// ⚠️ 这**不再**是文件完整性所需（每此一个新文件，见 [`ProbeScript`]），保留它是为了
+/// 不改变既有并发行为：取钥要起一次 Electron 子进程（0.5~1 s），同时起多个只会互相抢
+/// CPU 与文件句柄。**不要**把它当成「防竞态」的凭据 —— 防竞态靠 `create_new`。
 static PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// 起子进程取 `atRestSecretKey`。
@@ -350,19 +402,16 @@ pub fn fetch_build_key(exe: &Path) -> Result<String, AtRestError> {
     if !exe.exists() {
         return Err(AtRestError::ClientMissing);
     }
-    // ★ 持锁覆盖**整个函数**（写脚本 → 起子进程 → 等它读完）：探针文件是**固定名**
-    //   （见 `key_probe_path`），并发写会让先起的子进程读到空/半文件。
-    //   锁在函数返回时释放 —— 正好覆盖「子进程读文件」的窗口。
+    // 持锁覆盖「写脚本 → 起子进程 → 等它读完」：串行化 Electron 子进程。
     let _probe_guard = PROBE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-    let probe = key_probe_path();
-    std::fs::write(&probe, KEY_PROBE_JS)
-        .map_err(|e| AtRestError::Spawn(format!("写探针脚本失败：{e}")))?;
+    // 脚本随 `probe` 的作用域生存：函数返回（或被 `?` 提前返回）即删除。
+    let probe = write_probe_script()?;
 
     let mut child = crate::modules::process::cmd_builder(exe)
-        .arg(&probe)
+        .arg(&probe.path)
         .env("ELECTRON_RUN_AS_NODE", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -829,5 +878,58 @@ mod tests {
                 "可执行体名必须来自 Info.plist 的 CFBundleExecutable"
             );
         }
+    }
+
+    /// D5 护栏：探针脚本必须**每次一个新名字 + 独占创建 + 用毕即删**。
+    ///
+    /// 变异：把 `probe_script_path` 改回固定名 ⇒ 第一条断言红；
+    /// 把 `create_new(true)` 去掉 ⇒ 第二条断言红（已存在的路径会被覆盖）；
+    /// 删掉 `Drop` ⇒ 第三条断言红。
+    #[test]
+    fn probe_script_is_unique_exclusive_and_cleaned_up() {
+        let first = write_probe_script().expect("首次创建应成功");
+        assert!(first.path.is_file(), "脚本必须真的落盘");
+        let first_path = first.path.clone();
+
+        let second = write_probe_script().expect("第二次创建应成功");
+        assert_ne!(
+            first.path, second.path,
+            "每次调用必须是**新名字**（固定名就是 D5）"
+        );
+        assert!(
+            second.path.is_file(),
+            "两个探针脚本必须能同时存在（不再互相覆盖）"
+        );
+        let second_path = second.path.clone();
+
+        // 目标已存在 ⇒ `create_new` 必须失败，且**不得**覆盖原内容。
+        let before = std::fs::read_to_string(&first_path).expect("读回脚本");
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        assert!(
+            options.open(&first_path).is_err(),
+            "create_new 必须拒绝已存在的路径"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&first_path).expect("再读回脚本"),
+            before,
+            "独占创建失败时不得改动既有文件"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&first_path)
+                .expect("stat 探针脚本")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "临时脚本必须是 0600（同机他人不可读）");
+        }
+
+        drop(second);
+        assert!(!second_path.exists(), "`Drop` 必须删除脚本");
+        drop(first);
+        assert!(!first_path.exists(), "`Drop` 必须删除脚本（首个）");
     }
 }
